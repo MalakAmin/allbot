@@ -1,21 +1,38 @@
 import os
-import json
+import logging
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, JSON
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from dotenv import load_dotenv
+from sqlalchemy import JSON  # استيراد منفصل
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-# الاتصال بقاعدة البيانات
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///quiz_bot.db')
-if DATABASE_URL.startswith('postgres://'):
+# الحصول على رابط قاعدة البيانات
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+
+# تحويل الرابط للتنسيق الصحيح
+if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
+# إذا كان الرابط فارغاً، استخدم SQLite للتجربة المحلية
+if not DATABASE_URL:
+    DATABASE_URL = 'sqlite:///quiz_bot.db'
+    logger.warning("⚠️ لم يتم العثور على DATABASE_URL، استخدام SQLite محلياً")
+
+# إنشاء الاتصال
+try:
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+    logger.info(f"✅ تم الاتصال بقاعدة البيانات: {DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else 'محلي'}")
+except Exception as e:
+    logger.error(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
+    # استخدام SQLite كنسخة احتياطية
+    engine = create_engine('sqlite:///quiz_bot_backup.db')
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+    logger.warning("⚠️ استخدام SQLite كنسخة احتياطية")
 
 # ============= نماذج قاعدة البيانات =============
 
@@ -36,7 +53,7 @@ class Quiz(Base):
     
     id = Column(Integer, primary_key=True)
     teacher_id = Column(Integer, nullable=False)
-    quiz_code = Column(String(50), unique=True, nullable=False)  # كود الكويز
+    quiz_code = Column(String(50), unique=True, nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
     questions = Column(JSON)  # تخزين الأسئلة كـ JSON
@@ -55,7 +72,7 @@ class StudentAttempt(Base):
     answers = Column(JSON)  # تخزين الإجابات كـ JSON
     score = Column(Integer, default=0)
     total_questions = Column(Integer, default=0)
-    percentage = Column(Float, default=0)
+    percentage = Column(Integer, default=0)  # تخزين كنسبة مئوية * 100
     started_at = Column(DateTime, default=datetime.now)
     completed_at = Column(DateTime)
     is_completed = Column(Boolean, default=False)
@@ -69,7 +86,7 @@ def get_db():
     """الحصول على جلسة قاعدة البيانات"""
     db = SessionLocal()
     try:
-        return db
+        yield db
     finally:
         db.close()
 
@@ -88,8 +105,12 @@ def add_teacher(telegram_id, username, full_name):
             )
             db.add(teacher)
             db.commit()
-            return teacher
+            logger.info(f"✅ معلم جديد: {username}")
         return teacher
+    except Exception as e:
+        logger.error(f"❌ خطأ في إضافة المعلم: {e}")
+        db.rollback()
+        return None
     finally:
         db.close()
 
@@ -102,25 +123,31 @@ def is_teacher(telegram_id):
             Teacher.is_active == True
         ).first()
         return teacher is not None
+    except Exception as e:
+        logger.error(f"❌ خطأ في التحقق من المعلم: {e}")
+        return False
     finally:
         db.close()
 
 # ============= دوال الكويزات =============
 
+import random
+import string
+
 def generate_quiz_code():
     """توليد كود عشوائي للكويز"""
-    import random
-    import string
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
 def create_quiz(teacher_id, title, description, questions):
     """إنشاء كويز جديد"""
     db = SessionLocal()
     try:
-        quiz_code = generate_quiz_code()
-        # التأكد من عدم تكرار الكود
-        while db.query(Quiz).filter(Quiz.quiz_code == quiz_code).first():
+        # توليد كود فريد
+        while True:
             quiz_code = generate_quiz_code()
+            existing = db.query(Quiz).filter(Quiz.quiz_code == quiz_code).first()
+            if not existing:
+                break
         
         quiz = Quiz(
             teacher_id=teacher_id,
@@ -131,7 +158,12 @@ def create_quiz(teacher_id, title, description, questions):
         )
         db.add(quiz)
         db.commit()
+        logger.info(f"✅ كويز جديد: {title} - الكود: {quiz_code}")
         return quiz
+    except Exception as e:
+        logger.error(f"❌ خطأ في إنشاء الكويز: {e}")
+        db.rollback()
+        return None
     finally:
         db.close()
 
@@ -143,6 +175,9 @@ def get_quiz_by_code(quiz_code):
             Quiz.quiz_code == quiz_code.upper(),
             Quiz.is_active == True
         ).first()
+    except Exception as e:
+        logger.error(f"❌ خطأ في البحث عن الكويز: {e}")
+        return None
     finally:
         db.close()
 
@@ -154,27 +189,40 @@ def get_teacher_quizzes(teacher_id):
             Quiz.teacher_id == teacher_id,
             Quiz.is_active == True
         ).order_by(Quiz.created_at.desc()).all()
+    except Exception as e:
+        logger.error(f"❌ خطأ في جلب كويزات المعلم: {e}")
+        return []
     finally:
         db.close()
 
-def update_quiz(quiz_id, **kwargs):
-    """تحديث بيانات الكويز"""
+def get_quiz_statistics(quiz_id):
+    """الحصول على إحصائيات الكويز"""
     db = SessionLocal()
     try:
-        quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
-        if quiz:
-            for key, value in kwargs.items():
-                setattr(quiz, key, value)
-            db.commit()
-        return quiz
+        attempts = db.query(StudentAttempt).filter(
+            StudentAttempt.quiz_id == quiz_id,
+            StudentAttempt.is_completed == True
+        ).all()
+        
+        if not attempts:
+            return None
+        
+        total_attempts = len(attempts)
+        total_score = sum(a.score for a in attempts)
+        total_percentage = sum(a.percentage for a in attempts)
+        
+        return {
+            'total_attempts': total_attempts,
+            'avg_score': round(total_score / total_attempts, 1),
+            'avg_percentage': round(total_percentage / total_attempts, 1),
+            'max_score': max(a.score for a in attempts),
+            'min_score': min(a.score for a in attempts)
+        }
+    except Exception as e:
+        logger.error(f"❌ خطأ في جلب الإحصائيات: {e}")
+        return None
     finally:
         db.close()
-
-def delete_quiz(quiz_id):
-    """حذف كويز (تعطيله)"""
-    return update_quiz(quiz_id, is_active=False)
-
-# ============= دوال محاولات الطلاب =============
 
 def start_student_attempt(quiz_id, student_telegram_id, student_name):
     """بدء محاولة جديدة للطالب"""
@@ -196,23 +244,10 @@ def start_student_attempt(quiz_id, student_telegram_id, student_name):
             db.commit()
         
         return attempt
-    finally:
-        db.close()
-
-def save_answer(attempt_id, question_num, answer, is_correct):
-    """حفظ إجابة الطالب"""
-    db = SessionLocal()
-    try:
-        attempt = db.query(StudentAttempt).filter(StudentAttempt.id == attempt_id).first()
-        if attempt:
-            if not attempt.answers:
-                attempt.answers = {}
-            attempt.answers[str(question_num)] = {
-                'answer': answer,
-                'is_correct': is_correct
-            }
-            db.commit()
-        return attempt
+    except Exception as e:
+        logger.error(f"❌ خطأ في بدء المحاولة: {e}")
+        db.rollback()
+        return None
     finally:
         db.close()
 
@@ -224,11 +259,17 @@ def complete_attempt(attempt_id, score, total_questions):
         if attempt:
             attempt.score = score
             attempt.total_questions = total_questions
-            attempt.percentage = (score / total_questions) * 100 if total_questions > 0 else 0
+            percentage = (score / total_questions) * 100 if total_questions > 0 else 0
+            attempt.percentage = int(percentage)  # تخزين كرقم صحيح
             attempt.completed_at = datetime.now()
             attempt.is_completed = True
             db.commit()
+            logger.info(f"✅ محاولة منتهية: {attempt_id}, النتيجة: {score}/{total_questions}")
         return attempt
+    except Exception as e:
+        logger.error(f"❌ خطأ في إنهاء المحاولة: {e}")
+        db.rollback()
+        return None
     finally:
         db.close()
 
@@ -240,31 +281,30 @@ def get_student_attempts(student_telegram_id):
             StudentAttempt.student_telegram_id == student_telegram_id,
             StudentAttempt.is_completed == True
         ).order_by(StudentAttempt.completed_at.desc()).all()
+    except Exception as e:
+        logger.error(f"❌ خطأ في جلب محاولات الطالب: {e}")
+        return []
     finally:
         db.close()
 
-def get_quiz_statistics(quiz_id):
-    """الحصول على إحصائيات الكويز"""
+def save_answer(attempt_id, question_num, answer, is_correct):
+    """حفظ إجابة الطالب"""
     db = SessionLocal()
     try:
-        attempts = db.query(StudentAttempt).filter(
-            StudentAttempt.quiz_id == quiz_id,
-            StudentAttempt.is_completed == True
-        ).all()
-        
-        if not attempts:
-            return None
-        
-        total_attempts = len(attempts)
-        avg_score = sum(a.score for a in attempts) / total_attempts
-        avg_percentage = sum(a.percentage for a in attempts) / total_attempts
-        
-        return {
-            'total_attempts': total_attempts,
-            'avg_score': round(avg_score, 1),
-            'avg_percentage': round(avg_percentage, 1),
-            'max_score': max(a.score for a in attempts),
-            'min_score': min(a.score for a in attempts)
-        }
+        attempt = db.query(StudentAttempt).filter(StudentAttempt.id == attempt_id).first()
+        if attempt:
+            if not attempt.answers:
+                attempt.answers = {}
+            if isinstance(attempt.answers, dict):
+                attempt.answers[str(question_num)] = {
+                    'answer': answer,
+                    'is_correct': is_correct
+                }
+            db.commit()
+        return attempt
+    except Exception as e:
+        logger.error(f"❌ خطأ في حفظ الإجابة: {e}")
+        db.rollback()
+        return None
     finally:
         db.close()
